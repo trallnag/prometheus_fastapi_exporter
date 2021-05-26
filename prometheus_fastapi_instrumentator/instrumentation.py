@@ -4,6 +4,7 @@
 import gzip
 import os
 import re
+from functools import wraps
 from timeit import default_timer
 from typing import Callable, List, Optional, Pattern, Tuple
 
@@ -12,6 +13,7 @@ from prometheus_client import Gauge
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Match
+from starlette.types import Message, Receive, Scope, Send
 
 from prometheus_fastapi_instrumentator import metrics
 
@@ -127,14 +129,7 @@ class PrometheusFastApiInstrumentator:
             self.instrumentations.append(metrics.default())
 
         if self.should_instrument_requests_inprogress:
-            labels = (
-                (
-                    "method",
-                    "handler",
-                )
-                if self.inprogress_labels
-                else ()
-            )
+            labels = ("method", "handler",) if self.inprogress_labels else ()
             self.inprogress = Gauge(
                 name=self.inprogress_name,
                 documentation="Number of HTTP requests in progress.",
@@ -144,60 +139,73 @@ class PrometheusFastApiInstrumentator:
 
         # ----------------------------------------------------------------------
 
-        @app.middleware("http")
-        async def dispatch_middleware(request: Request, call_next) -> Response:
-            start_time = default_timer()
+        def _asgi_middleware_decorator(app: FastAPI) -> callable:
+            @wraps(app)
+            async def app_instrumentator(scope: Scope, receive: Receive, send: Send):
+                if scope["type"] not in ("http", "websocket"):
+                    await app(scope, receive, send)
 
-            handler, is_templated = self._get_handler(request)
-            is_excluded = self._is_handler_excluded(handler, is_templated)
-            handler = (
-                "none" if not is_templated and self.should_group_untemplated else handler
-            )
+                start_time = default_timer()
 
-            if not is_excluded and self.should_instrument_requests_inprogress:
-                inprogress: Gauge
-                if self.inprogress_labels:
-                    inprogress = self.inprogress.labels(request.method, handler)
-                else:
-                    inprogress = self.inprogress
-                inprogress.inc()
+                handler, is_templated = self._get_handler(app, scope)
+                is_excluded = self._is_handler_excluded(handler, is_templated)
+                handler = (
+                    "none"
+                    if not is_templated and self.should_group_untemplated
+                    else handler
+                )
 
-            response = None
-            status = "500"
+                if not is_excluded and self.should_instrument_requests_inprogress:
+                    inprogress: Gauge
+                    if self.inprogress_labels:
+                        inprogress = self.inprogress.labels(scope["method"], handler)
+                    else:
+                        inprogress = self.inprogress
+                    inprogress.inc()
 
-            try:
-                response = await call_next(request)
-                status = str(response.status_code)
-            except Exception as e:
-                raise e from None
-            finally:
-                if not is_excluded:
-                    duration = max(default_timer() - start_time, 0)
+                status = "500"
+                response_headers = {}
 
-                    if self.should_instrument_requests_inprogress:
-                        inprogress.dec()  # type: ignore
+                async def wrapped_send(message: Message):
+                    if message["type"] == "http.response.start":
+                        nonlocal status, response_headers
+                        status = str(message["status"])
+                        response_headers = dict(message["headers"])
 
-                    if self.should_round_latency_decimals:
-                        duration = round(duration, self.round_latency_decimals)
+                    await send(message)
 
-                    if self.should_group_status_codes:
-                        status = status[0] + "xx"
+                try:
+                    await app(scope, receive, wrapped_send)
+                except Exception as exc:
+                    raise exc from None
+                finally:
+                    if not is_excluded:
+                        duration = max(default_timer() - start_time, 0)
 
-                    info = metrics.Info(
-                        request=request,
-                        response=response,
-                        method=request.method,
-                        modified_handler=handler,
-                        modified_status=status,
-                        modified_duration=duration,
-                    )
+                        if self.should_instrument_requests_inprogress:
+                            inprogress.dec()  # type: ignore
 
-                    for instrumentation in self.instrumentations:
-                        instrumentation(info)
+                        if self.should_round_latency_decimals:
+                            duration = round(duration, self.round_latency_decimals)
 
-            return response
+                        if self.should_group_status_codes:
+                            status = status[0] + "xx"
 
-        # ----------------------------------------------------------------------
+                        info = metrics.Info(
+                            request=dict(scope["headers"]),
+                            response=response_headers,
+                            method=scope["method"],
+                            modified_handler=handler,
+                            modified_status=status,
+                            modified_duration=duration,
+                        )
+
+                        for instrumentation in self.instrumentations:
+                            instrumentation(info)
+
+            return app_instrumentator
+
+        app = _asgi_middleware_decorator(app)
 
         return self
 
@@ -303,24 +311,14 @@ class PrometheusFastApiInstrumentator:
 
     # ==========================================================================
 
-    def _get_handler(self, request: Request) -> Tuple[str, bool]:
-        """Extracts either template or (if no template) path.
-
-        Args:
-            request (Request): Python Requests request object.
-
-        Returns:
-            Tuple[str, bool]: Tuple with two elements. First element is either
-                template or if no template the path. Second element tells you
-                if the path is templated or not.
-        """
-
-        for route in request.app.routes:
-            match, _ = route.matches(request.scope)
+    @staticmethod
+    def _get_handler(app: FastAPI, scope: Scope):
+        for route in app.router.routes:
+            match, _ = route.matches(scope)
             if match == Match.FULL:
                 return route.path, True
 
-        return request.url.path, False
+        return scope["path"], False
 
     # ==========================================================================
 

@@ -119,7 +119,7 @@ class PrometheusFastApiInstrumentator:
 
         if (
             self.should_respect_env_var
-            and os.environ.get(self.env_var_name, "false") != "true"
+            and not self._should_instrumentate()
         ):
             return self
 
@@ -242,7 +242,7 @@ class PrometheusFastApiInstrumentator:
 
         if (
             self.should_respect_env_var
-            and os.environ.get(self.env_var_name, "false") != "true"
+            and not self._should_instrumentate()
         ):
             return self
 
@@ -323,6 +323,10 @@ class PrometheusFastApiInstrumentator:
         return request.url.path, False
 
     # ==========================================================================
+
+    def _should_instrumentate(self):
+        """Check if the environment variable is set to a truthy value"""
+        return os.getenv(self.env_var, 'False').lower() in ['true', '1']
 
     def _is_handler_excluded(self, handler: str, is_templated: bool) -> bool:
         """Determines if the handler should be ignored.

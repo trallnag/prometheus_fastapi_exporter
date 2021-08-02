@@ -1,11 +1,11 @@
 # Copyright © 2020 Tim Schwenke <tim.and.trallnag+code@gmail.com>
 # Licensed under Apache License 2.0 <http://www.apache.org/licenses/LICENSE-2.0>
-
+import asyncio
 import gzip
 import os
 import re
 from timeit import default_timer
-from typing import Callable, List, Optional, Pattern, Tuple
+from typing import Callable, List, Optional, Pattern, Tuple, Union, Awaitable
 
 from fastapi import FastAPI
 from prometheus_client import Gauge
@@ -99,6 +99,7 @@ class PrometheusFastApiInstrumentator:
             self.excluded_handlers = []
 
         self.instrumentations: List[Callable[[metrics.Info], None]] = []
+        self.async_instrumentations: List[Callable[[metrics.Info], Awaitable[None]]] = []
 
     # ==========================================================================
 
@@ -195,6 +196,10 @@ class PrometheusFastApiInstrumentator:
                     for instrumentation in self.instrumentations:
                         instrumentation(info)
 
+                    await asyncio.gather(*[
+                        instrumentation(info) for instrumentation in self.async_instrumentations
+                    ])
+
             return response
 
         # ----------------------------------------------------------------------
@@ -284,7 +289,10 @@ class PrometheusFastApiInstrumentator:
 
     # ==========================================================================
 
-    def add(self, instrumentation_function: Callable[[metrics.Info], None]):
+    def add(
+        self,
+        instrumentation_function: Callable[[metrics.Info], Union[None, Awaitable[None]]]
+    ) -> 'PrometheusFastApiInstrumentator':
         """Adds function to list of instrumentations.
 
         Args:
@@ -296,8 +304,10 @@ class PrometheusFastApiInstrumentator:
         Returns:
             self: Instrumentator. Builder Pattern.
         """
-
-        self.instrumentations.append(instrumentation_function)
+        if asyncio.iscoroutinefunction(instrumentation_function):
+            self.async_instrumentations.append(instrumentation_function)
+        else:
+            self.instrumentations.append(instrumentation_function)
 
         return self
 

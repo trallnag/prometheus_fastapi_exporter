@@ -18,7 +18,7 @@ starlette  = ">= 0.30.0, < 1.0.0"
 prometheus-client = ">= 0.8.0, < 1.0.0"
 
 [tool.poetry.group.dev.dependencies]
-httpx = "^0.23.3"
+httpx = ">=0.23.3,<0.28.0"
 black = "^24.2.0"
 flake8 = "^7.0.0"
 requests = "^2.31.0"
